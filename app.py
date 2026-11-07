@@ -128,7 +128,10 @@ def main():
         cooldown_min = sb.slider("Re-alert same box after (minutes)", 1, 60, 15)
         if sb.button("Send test message"):
             ok, msg = send_telegram(tg_token, tg_chat, "Box spread finder: test message OK.")
-            sb.success("Test message sent.") if ok else sb.error(msg)
+            if ok:
+                sb.success("Test message sent.")
+            else:
+                sb.error(msg)
 
         try:
             if provider == "Upstox":
