@@ -15,7 +15,7 @@ import core
 from core import (CostConfig, FilterConfig, LOT_SIZE, REQUIRED_COLS, angel_banknifty_options,
                   angel_login, angel_monthly_expiries, atm_band, fetch_angel_chain, fetch_live_chain,
                   load_angel_master,
-                  find_opportunities, format_alert, get_monthly_expiries, is_monthly_expiry,
+                  apply_ltp_fallback, find_opportunities, format_alert, get_monthly_expiries, is_monthly_expiry,
                   load_data, market_open_now, now_ist, select_new_alerts, send_telegram, validate)
 
 DISCLAIMER = (
@@ -111,6 +111,9 @@ def main():
         provider = sb.radio("Broker", ["Upstox", "Angel One"], horizontal=True)
         refresh_s = sb.slider("Auto-refresh every (seconds)", 5 if provider == "Upstox" else 10, 120, 15)
         auto = sb.checkbox("Auto-refresh", True)
+        use_ltp = sb.checkbox("Market closed: use last traded prices (indicative)", True,
+                              help="After 3:30 PM bid/ask is usually empty. This fills the gaps with the last "
+                                   "traded price so you can see whether a box existed at the close.")
         token = conn = opts = None
         if provider == "Upstox":
             token = sb.text_input("Upstox access token", os.getenv("UPSTOX_ACCESS_TOKEN", ""), type="password")
@@ -179,9 +182,25 @@ def main():
             open_now = market_open_now()
             st.caption(f"Updated {now_ist():%H:%M:%S} IST | Spot {spot:,.2f} | ATM {atm:,.0f} | "
                        f"strike step {interval:.0f} | scanning {atm - band:,.0f} to {atm + band:,.0f}")
-            if not open_now:
-                st.warning("Market appears closed (Mon-Fri 09:15-15:30 IST). Quotes may be stale; "
-                           "Telegram alerts are paused.")
+            if open_now:
+                # keep the latest in-session chain so it can be downloaded after the close
+                st.session_state["snapshot"] = {"chain": chain.copy(), "time": now_ist(), "spot": spot}
+            else:
+                st.warning("Market is closed (Mon-Fri 09:15-15:30 IST). Showing the last data the broker "
+                           "returns. Telegram alerts are paused.")
+                if use_ltp:
+                    chain, n_filled = apply_ltp_fallback(chain)
+                    if n_filled:
+                        st.info(f"INDICATIVE RESULT: {n_filled} missing bid/ask quote(s) were replaced by the last "
+                                "traded price. Last prices are not simultaneous and not executable, so treat any "
+                                "'opportunity' below as a hint to check at the next open, not a real trade.")
+            snap = st.session_state.get("snapshot")
+            if snap is not None:
+                st.download_button(
+                    f"Download last in-session chain ({snap['time']:%d-%b %H:%M} IST)",
+                    snap["chain"].to_csv(index=False).encode(),
+                    file_name=f"banknifty_chain_{snap['time']:%Y%m%d_%H%M}.csv", mime="text/csv",
+                    key="dl_snap")
             all_df, viable = render_scan(chain, expiry, f, c, now_ist().date(), lot, key="live")
             if tg_on and open_now and not viable.empty:
                 new = select_new_alerts(viable, st.session_state["last_sent"], cooldown_min * 60)

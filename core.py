@@ -5,8 +5,12 @@ Education / research only. Not investment advice.
 """
 from __future__ import annotations
 
+import base64
 import calendar
+import hashlib
+import hmac
 import os
+import struct
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -19,6 +23,8 @@ from zoneinfo import ZoneInfo
 # ----------------------------------------------------------------------------
 # CONFIG (all constants are configurable from the UI sidebar as well)
 # ----------------------------------------------------------------------------
+OPTIONAL_COLS = ["ce_ltp", "pe_ltp"]   # last traded price, used only for the after-hours fallback
+
 LOT_SIZE = 30  # BANKNIFTY lot size (as specified; change here if NSE revises)
 
 REQUIRED_COLS = [
@@ -76,8 +82,9 @@ def validate(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     if missing:
         raise ValueError(f"Missing required column(s): {', '.join(missing)}")
 
-    df = df[REQUIRED_COLS].copy()
-    num_cols = [c for c in REQUIRED_COLS if c != "expiry_date"]
+    keep = REQUIRED_COLS + [c for c in OPTIONAL_COLS if c in df.columns]
+    df = df[keep].copy()
+    num_cols = [c for c in keep if c != "expiry_date"]
     for c in num_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce").dt.date
@@ -395,9 +402,10 @@ def parse_upstox_chain(js: dict, expiry: date) -> tuple[pd.DataFrame, float]:
             "pe_bid": _num(pe.get("bid_price")), "pe_ask": _num(pe.get("ask_price")),
             "pe_oi": _num(pe.get("oi")), "pe_volume": _num(pe.get("volume")),
             "expiry_date": expiry,
+            "ce_ltp": _num(ce.get("ltp")), "pe_ltp": _num(pe.get("ltp")),
         })
     spot = float(np.median(spots)) if spots else float("nan")
-    return pd.DataFrame(rows, columns=REQUIRED_COLS), spot
+    return pd.DataFrame(rows, columns=REQUIRED_COLS + OPTIONAL_COLS), spot
 
 
 def fetch_live_chain(token: str, expiry: date) -> tuple[pd.DataFrame, float]:
@@ -472,24 +480,68 @@ ANGEL_BANKNIFTY_SPOT = ("NSE", "99926009")   # Nifty Bank index token
 _MASTER_CACHE: dict = {}
 
 
-def angel_login(api_key: str, client_code: str, pin: str, totp_secret: str = "", totp_code: str = ""):
-    """Log in via the official smartapi-python SDK. Returns the SmartConnect object."""
+def totp_now(secret: str, t: float | None = None, digits: int = 6, step: int = 30) -> str:
+    """RFC 6238 TOTP (SHA1) using only the standard library (no pyotp needed)."""
+    clean = secret.strip().replace(" ", "").upper()
     try:
-        from SmartApi import SmartConnect
-    except ImportError as e:
-        raise RuntimeError("Install the Angel One SDK: pip install smartapi-python pyotp") from e
-    if totp_secret:
+        key = base64.b32decode(clean + "=" * (-len(clean) % 8))
+    except Exception as e:
+        raise RuntimeError("TOTP secret is not valid (it should be letters A-Z and digits 2-7).") from e
+    counter = int((time.time() if t is None else t) // step)
+    h = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+class AngelREST:
+    """Minimal Angel One SmartAPI client over plain REST (no SDK dependency)."""
+    BASE = "https://apiconnect.angelone.in"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.jwt: str | None = None
+
+    def _headers(self) -> dict:
+        h = {"Content-Type": "application/json", "Accept": "application/json",
+             "X-UserType": "USER", "X-SourceID": "WEB",
+             "X-ClientLocalIP": "127.0.0.1", "X-ClientPublicIP": "127.0.0.1",
+             "X-MACAddress": "00:00:00:00:00:00", "X-PrivateKey": self.api_key}
+        if self.jwt:
+            h["Authorization"] = f"Bearer {self.jwt}"
+        return h
+
+    def _post(self, path: str, body: dict) -> dict:
         try:
-            import pyotp
-        except ImportError as e:
-            raise RuntimeError("Install pyotp: pip install pyotp") from e
-        totp_code = pyotp.TOTP(totp_secret.strip().replace(" ", "")).now()
+            r = requests.post(self.BASE + path, json=body, headers=self._headers(), timeout=15)
+            return r.json()
+        except requests.RequestException as e:
+            raise RuntimeError(f"Network error talking to Angel One: {e}") from e
+        except ValueError as e:
+            raise RuntimeError("Angel One returned a non-JSON reply (check API key / IP restrictions).") from e
+
+    def generateSession(self, client_code: str, pin: str, totp: str) -> dict:
+        js = self._post("/rest/auth/angelbroking/user/v1/loginByPassword",
+                        {"clientcode": client_code, "password": pin, "totp": totp})
+        if js.get("status") and (js.get("data") or {}).get("jwtToken"):
+            self.jwt = js["data"]["jwtToken"]
+        return js
+
+    def getMarketData(self, mode: str, exchangeTokens: dict) -> dict:
+        return self._post("/rest/secure/angelbroking/market/v1/quote/",
+                          {"mode": mode, "exchangeTokens": exchangeTokens})
+
+
+def angel_login(api_key: str, client_code: str, pin: str, totp_secret: str = "", totp_code: str = "") -> AngelREST:
+    """Log in to Angel One. Provide the TOTP secret (auto) or the current 6-digit code."""
+    if totp_secret:
+        totp_code = totp_now(totp_secret)
     if not (api_key and client_code and pin and totp_code):
         raise RuntimeError("Angel One needs API key, client code, PIN and TOTP (secret or current code).")
-    obj = SmartConnect(api_key=api_key)
-    resp = obj.generateSession(client_code, pin, totp_code)
-    if not resp or not resp.get("status"):
-        raise RuntimeError(f"Angel One login failed: {(resp or {}).get('message', 'unknown error')}")
+    obj = AngelREST(api_key.strip())
+    resp = obj.generateSession(client_code.strip(), pin.strip(), totp_code.strip())
+    if not resp.get("status"):
+        raise RuntimeError(f"Angel One login failed: {resp.get('message', 'unknown error')}")
     return obj
 
 
@@ -593,10 +645,32 @@ def fetch_angel_chain(conn, opts: pd.DataFrame, expiry: date, band: float) -> tu
         d[f"{p}_ask"] = _best(q.get("depth"), "sell")
         d[f"{p}_oi"] = _num(q.get("opnInterest"))
         d[f"{p}_volume"] = _num(q.get("tradeVolume"))
+        d[f"{p}_ltp"] = _num(q.get("ltp"))
     df = pd.DataFrame(list(rows.values()))
-    for col in REQUIRED_COLS:
+    for col in REQUIRED_COLS + OPTIONAL_COLS:
         if col not in df.columns:
             df[col] = np.nan
     if df.empty:
         raise RuntimeError("Angel One returned no option quotes (market closed or token problem).")
-    return df[REQUIRED_COLS], spot
+    return df[REQUIRED_COLS + OPTIONAL_COLS], spot
+
+
+def apply_ltp_fallback(chain: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    After hours the order book is usually empty (bid/ask = 0). Where bid or ask is missing,
+    use the last traded price for both. INDICATIVE ONLY: last prices are not simultaneous
+    and not executable. Returns (new_chain, number_of_quotes_filled).
+    """
+    ch = chain.copy()
+    filled = 0
+    for p in ("ce", "pe"):
+        if f"{p}_ltp" not in ch.columns:
+            continue
+        for col in (f"{p}_bid", f"{p}_ask", f"{p}_ltp"):
+            ch[col] = pd.to_numeric(ch[col], errors="coerce").astype(float)
+        bad = (ch[f"{p}_bid"].isna() | ch[f"{p}_ask"].isna() | (ch[f"{p}_bid"] <= 0) | (ch[f"{p}_ask"] <= 0))
+        ok = bad & (ch[f"{p}_ltp"] > 0)
+        ch.loc[ok, f"{p}_bid"] = ch.loc[ok, f"{p}_ltp"]
+        ch.loc[ok, f"{p}_ask"] = ch.loc[ok, f"{p}_ltp"]
+        filled += int(ok.sum())
+    return ch, filled
