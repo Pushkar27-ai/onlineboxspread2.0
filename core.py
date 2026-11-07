@@ -475,9 +475,11 @@ def select_new_alerts(viable: pd.DataFrame, last_sent: dict, cooldown_s: float,
 # ----------------------------------------------------------------------------
 # LIVE DATA #2: ANGEL ONE (SmartAPI)
 # ----------------------------------------------------------------------------
-ANGEL_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_Files/files/OpenAPIScripMaster.json"
+ANGEL_MASTER_URLS = [
+    "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
+    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+]
 ANGEL_BANKNIFTY_SPOT = ("NSE", "99926009")   # Nifty Bank index token
-_MASTER_CACHE: dict = {}
 
 
 def totp_now(secret: str, t: float | None = None, digits: int = 6, step: int = 30) -> str:
@@ -545,19 +547,37 @@ def angel_login(api_key: str, client_code: str, pin: str, totp_secret: str = "",
     return obj
 
 
-def load_angel_master(force: bool = False) -> list[dict]:
-    """Instrument master (large JSON, cached per day)."""
+def load_angel_master() -> list[dict]:
+    """Download Angel One's instrument master (~40 MB JSON; can be slow). Tries both known URLs."""
+    last = "unknown error"
+    for url in ANGEL_MASTER_URLS:
+        try:
+            r = requests.get(url, timeout=180)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list) and data:
+                return data
+            last = "empty reply"
+        except (requests.RequestException, ValueError) as e:
+            last = str(e)
+    raise RuntimeError(f"Could not download Angel One instrument master: {last}")
+
+
+_OPTS_CACHE: dict = {}
+
+
+def get_angel_banknifty_options(force: bool = False) -> pd.DataFrame:
+    """BANKNIFTY option contracts, downloaded once per day. Only the small filtered table is kept in memory."""
     today = now_ist().date()
-    if not force and _MASTER_CACHE.get("date") == today:
-        return _MASTER_CACHE["data"]
-    try:
-        r = requests.get(ANGEL_MASTER_URL, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-    except (requests.RequestException, ValueError) as e:
-        raise RuntimeError(f"Could not download Angel One instrument master: {e}") from e
-    _MASTER_CACHE.update(date=today, data=data)
-    return data
+    if not force and _OPTS_CACHE.get("date") == today:
+        return _OPTS_CACHE["opts"]
+    master = load_angel_master()
+    opts = angel_banknifty_options(master)
+    del master
+    if opts.empty:
+        raise RuntimeError("Angel One instrument list had no BANKNIFTY option contracts.")
+    _OPTS_CACHE.update(date=today, opts=opts)
+    return opts
 
 
 def angel_banknifty_options(master: list[dict]) -> pd.DataFrame:

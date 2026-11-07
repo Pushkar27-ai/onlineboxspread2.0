@@ -12,9 +12,8 @@ import pandas as pd
 import streamlit as st
 
 import core
-from core import (CostConfig, FilterConfig, LOT_SIZE, REQUIRED_COLS, angel_banknifty_options,
+from core import (CostConfig, FilterConfig, LOT_SIZE, REQUIRED_COLS, get_angel_banknifty_options,
                   angel_login, angel_monthly_expiries, atm_band, fetch_angel_chain, fetch_live_chain,
-                  load_angel_master,
                   apply_ltp_fallback, find_opportunities, format_alert, get_monthly_expiries, is_monthly_expiry,
                   load_data, market_open_now, now_ist, select_new_alerts, send_telegram, validate)
 
@@ -152,7 +151,7 @@ def main():
                         st.session_state["angel_id"] = (a_key, a_client)
                 if "angel_opts" not in st.session_state:
                     with st.spinner("Downloading instrument list (large file, once a day)..."):
-                        st.session_state["angel_opts"] = angel_banknifty_options(load_angel_master())
+                        st.session_state["angel_opts"] = get_angel_banknifty_options()
                 conn, opts = st.session_state["angel_conn"], st.session_state["angel_opts"]
                 expiries = angel_monthly_expiries(opts)
         except RuntimeError as e:
