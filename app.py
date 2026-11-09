@@ -46,10 +46,20 @@ def render_scan(chain, expiry, f, c, val_date, lot, key=""):
         st.info("No arbitrage found after costs and filters.")
         if all_df.empty:
             st.write("No strike pair passed the liquidity/spread filters, so there are no candidates to show.")
+            shown = all_df
         else:
-            st.subheader("Closest 3 candidates (not profitable)")
-            st.dataframe(all_df.head(3)[DISPLAY_COLS], hide_index=True, width="stretch")
-        shown = all_df.head(3)
+            st.subheader("Closest candidates (not profitable)")
+            st.caption("'Short by' = how many index points cheaper/richer the box would need to be to break even after all costs.")
+            parts = []
+            for kind, label in (("DEBIT", "Debit boxes (buy the box)"), ("CREDIT", "Credit boxes (sell the box)")):
+                sub = all_df[all_df["Type"] == kind].head(3).copy()
+                if sub.empty:
+                    continue
+                sub["Short by (pts)"] = (-sub["NET Profit"] / lot).clip(lower=0).round(2)
+                st.markdown(f"**{label}**")
+                st.dataframe(sub[DISPLAY_COLS + ["Short by (pts)"]], hide_index=True, width="stretch")
+                parts.append(sub)
+            shown = pd.concat(parts) if parts else all_df.head(3)
     else:
         st.success(f"{len(viable)} viable opportunity(ies) found.")
         st.subheader("Ranked opportunities (NET profit per lot)")
