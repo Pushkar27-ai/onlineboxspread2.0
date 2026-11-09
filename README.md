@@ -96,3 +96,26 @@ depth, plus OI and volume); the contract list comes from Angel's instrument mast
 
 **Update (v3.1):** Angel One now uses plain REST calls, so `smartapi-python` and `pyotp` are no longer needed
 (TOTP is computed with Python's standard library). `requirements.txt` was reduced accordingly.
+
+---
+## v4: Sensex support
+Pick **Underlying** in the sidebar: Bank Nifty (NSE) or Sensex (BSE).
+- Sensex: lot size 20 (default, editable), weekly expiry every Thursday plus monthly (last Thursday; a holiday moves it earlier). Tick/untick **Include weekly expiries**.
+- Live data: Upstox uses instrument key `BSE_INDEX|SENSEX`; Angel One uses the BFO segment and the BSE index token 99919000.
+- Monthly expiry is detected from the data (last expiry of the month), so holiday-shifted dates work.
+- **Check costs for Sensex:** BSE's exchange transaction charge is not the same as NSE's. The default in the sidebar is the NSE figure; change it to your broker's BSE rate.
+- Sensex and Angel/Upstox details were tested with mocked responses only. Verify on a live market day.
+
+---
+## v5: Settings panel on the right (no code edits needed)
+All settings now live in a panel on the **right** side of the page:
+- **Contract:** underlying (Bank Nifty / Sensex), lot size, ATM band.
+- **Instrument settings (advanced):** monthly-expiry weekday, weekly expiries yes/no, Upstox instrument key, Angel segment/name/spot token. Use this if an exchange revises a contract or a key is rejected.
+- **Filters, Transaction costs** (Exchange charges are stored separately for each underlying), **Live data**, **Telegram alerts**.
+- **Save / load settings:** download a settings file and load it next time. Tokens, PIN and TOTP secrets are never saved to it.
+On a phone the panel appears below the results. Streamlit Cloud does not remember settings between visits, so use the settings file.
+
+## v5.1: Box rules in Settings
+New **Box rules** section: debit / credit on-off, min and max strike width, lowest and highest strike to use,
+min NET profit (Rs), min NET edge %, min ROI %, min annualized %, sort order and max rows shown.
+**Number of lots** (Contract) scales profit, costs and ROI to lots x lot size units; brokerage is per order, so it does not scale.

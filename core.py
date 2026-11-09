@@ -13,7 +13,7 @@ import os
 import struct
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -25,7 +25,22 @@ from zoneinfo import ZoneInfo
 # ----------------------------------------------------------------------------
 OPTIONAL_COLS = ["ce_ltp", "pe_ltp"]   # last traded price, used only for the after-hours fallback
 
-LOT_SIZE = 30  # BANKNIFTY lot size (as specified; change here if NSE revises)
+LOT_SIZE = 30  # default lot size (Bank Nifty); each underlying below has its own
+
+# Supported underlyings. Lot sizes / expiry rules are as published for 2026; edit if the exchange revises.
+INSTRUMENTS = {
+    "BANKNIFTY": {"label": "Bank Nifty (NSE)", "short": "Bank Nifty", "lot": 30,
+                  "weekday": 1,            # monthly expiry = last Tuesday (holiday -> earlier day)
+                  "has_weekly": False, "exch_pct": 0.03503,
+                  "upstox_key": "NSE_INDEX|Nifty Bank",
+                  "angel_seg": "NFO", "angel_name": "BANKNIFTY", "angel_spot": ("NSE", "99926009")},
+    "SENSEX": {"label": "Sensex (BSE)", "short": "Sensex", "lot": 20,
+               "weekday": 3,               # monthly expiry = last Thursday (holiday -> earlier day)
+               "has_weekly": True,         # weekly options expire every Thursday
+               "exch_pct": 0.03503,        # NSE figure used as placeholder: set your broker's BSE rate in Settings
+               "upstox_key": "BSE_INDEX|SENSEX",
+               "angel_seg": "BFO", "angel_name": "SENSEX", "angel_spot": ("BSE", "99919000")},
+}
 
 REQUIRED_COLS = [
     "strike", "ce_bid", "ce_ask", "ce_oi", "ce_volume",
@@ -54,6 +69,15 @@ class FilterConfig:
     min_edge_pct: float = 0.1           # min NET profit as % of strike width
     min_width: float = 200.0
     max_width: float = 1000.0
+    allow_debit: bool = True            # scan debit boxes (buy the box)
+    allow_credit: bool = True           # scan credit boxes (sell the box)
+    min_net_profit: float = 0.0         # Rs, for the whole position (after all costs)
+    min_roi_pct: float = 0.0
+    min_annualized_pct: float = 0.0
+    strike_low: float = 0.0             # only use strikes >= this (0 = off)
+    strike_high: float = 0.0            # only use strikes <= this (0 = off)
+    sort_by: str = "NET Profit"         # NET Profit / ROI % / Annualized %
+    max_results: int = 20               # rows shown in the ranked table
 
 
 # ----------------------------------------------------------------------------
@@ -104,16 +128,25 @@ def validate(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     return df.sort_values(["expiry_date", "strike"]).reset_index(drop=True), warnings
 
 
-def monthly_from_list(dates) -> list[date]:
+def monthly_from_list(dates, weekday: int | None = None) -> list[date]:
     """
-    Monthly expiry = the LAST expiry date of each calendar month in the list.
-    This handles holiday shifts (e.g. Tuesday holiday -> Monday expiry) that a
-    fixed 'last Tuesday' rule would miss.
+    Monthly expiry = the LAST expiry date of each calendar month in the list. This handles holiday
+    shifts (e.g. Tuesday holiday -> Monday expiry). If `weekday` is given (Tue=1, Thu=3), a month is
+    kept only when its last listed expiry falls in the final days of that month's last such weekday,
+    so months whose contracts are only partly listed are not mistaken for monthly expiries.
     """
     last: dict[tuple[int, int], date] = {}
     for d in sorted(set(dates)):
         last[(d.year, d.month)] = d
-    return sorted(last.values())
+    out = []
+    for (y, m), d in sorted(last.items()):
+        if weekday is not None:
+            ld = date(y, m, calendar.monthrange(y, m)[1])
+            wd = ld - timedelta(days=(ld.weekday() - weekday) % 7)
+            if d < wd - timedelta(days=3):
+                continue
+        out.append(d)
+    return sorted(out)
 
 
 def is_monthly_expiry(d: date) -> bool:
@@ -221,9 +254,13 @@ def find_opportunities(
             width = H - L
             if H <= L or width < f.min_width or width > f.max_width:
                 continue
+            if (f.strike_low and L < f.strike_low) or (f.strike_high and H > f.strike_high):
+                continue
             stats["pairs_checked"] += 1
 
             for kind in ("DEBIT", "CREDIT"):
+                if (kind == "DEBIT" and not f.allow_debit) or (kind == "CREDIT" and not f.allow_credit):
+                    continue
                 if kind == "DEBIT":
                     # Buy CE@L, Sell CE@H, Buy PE@H, Sell PE@L
                     spec = [
@@ -301,16 +338,22 @@ def find_opportunities(
             "Total Costs", "NET Profit", "ROI %", "Annualized %", "Liquidity Score",
             "Mid Gross Profit", "Mid NET Profit", "_legs", "_costs", "_edge_pct"]
     all_df = pd.DataFrame(rows, columns=cols)
-    all_df = rank(all_df)
-    viable = all_df[(all_df["NET Profit"] > 0) & (all_df["_edge_pct"] >= f.min_edge_pct)]
+    all_df = rank(all_df, f.sort_by)
+    viable = all_df[(all_df["NET Profit"] > 0) & (all_df["_edge_pct"] >= f.min_edge_pct)
+                    & (all_df["NET Profit"] >= f.min_net_profit)]
+    if f.min_roi_pct:
+        viable = viable[viable["ROI %"].fillna(-1e9) >= f.min_roi_pct]
+    if f.min_annualized_pct:
+        viable = viable[viable["Annualized %"].fillna(-1e9) >= f.min_annualized_pct]
     return all_df, viable.reset_index(drop=True), stats
 
 
-def rank(df: pd.DataFrame) -> pd.DataFrame:
-    """Sort by NET profit (desc), ties broken by liquidity score."""
+def rank(df: pd.DataFrame, sort_by: str = "NET Profit") -> pd.DataFrame:
+    """Sort by the chosen column (desc), ties broken by NET profit then liquidity score."""
     if df.empty:
         return df
-    return df.sort_values(["NET Profit", "Liquidity Score"], ascending=False).reset_index(drop=True)
+    by = [c for c in dict.fromkeys([sort_by, "NET Profit", "Liquidity Score"]) if c in df.columns]
+    return df.sort_values(by, ascending=False, na_position="last").reset_index(drop=True)
 
 
 
@@ -376,19 +419,24 @@ def last_tuesdays(n: int = 3, today: date | None = None) -> list[date]:
     return out
 
 
-def get_monthly_expiries(token: str, n: int = 3) -> list[date]:
-    """Monthly Bank Nifty expiries from Upstox; falls back to the last-Tuesday rule."""
+def get_expiries(token: str, symbol: str = "BANKNIFTY", weekly: bool = False, n: int | None = None,
+                 cfg: dict | None = None) -> list[date]:
+    """Upcoming expiries from Upstox: monthly only, or weekly + monthly (where the underlying has weeklies).
+    `cfg` overrides the built-in INSTRUMENTS entry (used by the in-app advanced settings)."""
+    cfg = cfg or INSTRUMENTS[symbol]
+    include_weekly = weekly and cfg["has_weekly"]
+    n = n or (6 if include_weekly else 3)
     today = now_ist().date()
     try:
-        js = _upstox_get("/option/contract", token, {"instrument_key": BANKNIFTY_KEY})
-        exps = {_to_date(c.get("expiry")) for c in js.get("data", [])}
-        exps = monthly_from_list(e for e in exps if e and e >= today)
-        if exps:
-            return exps[:n]
+        js = _upstox_get("/option/contract", token, {"instrument_key": cfg["upstox_key"]})
+        exps = sorted({e for e in (_to_date(c.get("expiry")) for c in js.get("data", [])) if e and e >= today})
+        out = exps if include_weekly else monthly_from_list(exps, cfg["weekday"])
+        if out:
+            return out[:n]
     except RuntimeError as e:
         if "token" in str(e).lower() or "401" in str(e):
             raise
-    return last_tuesdays(n)
+    return last_tuesdays(n) if symbol == "BANKNIFTY" and cfg.get("weekday") == 1 else []
 
 
 def _num(x):
@@ -420,9 +468,11 @@ def parse_upstox_chain(js: dict, expiry: date) -> tuple[pd.DataFrame, float]:
     return pd.DataFrame(rows, columns=REQUIRED_COLS + OPTIONAL_COLS), spot
 
 
-def fetch_live_chain(token: str, expiry: date) -> tuple[pd.DataFrame, float]:
+def fetch_live_chain(token: str, expiry: date, symbol: str = "BANKNIFTY",
+                     cfg: dict | None = None) -> tuple[pd.DataFrame, float]:
+    cfg = cfg or INSTRUMENTS[symbol]
     js = _upstox_get("/option/chain", token,
-                     {"instrument_key": BANKNIFTY_KEY, "expiry_date": expiry.isoformat()})
+                     {"instrument_key": cfg["upstox_key"], "expiry_date": expiry.isoformat()})
     df, spot = parse_upstox_chain(js, expiry)
     if df.empty:
         raise RuntimeError("Upstox returned an empty option chain for this expiry.")
@@ -456,14 +506,14 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> tuple[bool, str]:
         return False, f"Network error: {e}"
 
 
-def format_alert(row: pd.Series, spot: float, atm: float, lot: int = LOT_SIZE) -> str:
+def format_alert(row: pd.Series, spot: float, atm: float, lot: int = LOT_SIZE, label: str = "Bank Nifty") -> str:
     legs = "\n".join(f"  {l['side']:<4} {l['type']} {int(l['strike'])} @ bid {l['bid']:.2f} / ask {l['ask']:.2f}"
                      for l in row["_legs"])
     return (
-        f"BOX SPREAD ({row['Type']}) - Bank Nifty {row['Expiry']:%d-%b-%Y}\n"
+        f"BOX SPREAD ({row['Type']}) - {label} {row['Expiry']:%d-%b-%Y}\n"
         f"Spot {spot:.0f} | ATM {atm:.0f} | Strikes {int(row['L'])}/{int(row['H'])} "
         f"(width {int(row['Strike Width'])})\n"
-        f"NET profit/lot ({lot}): Rs {row['NET Profit']:.2f} after costs "
+        f"NET profit (qty {lot}): Rs {row['NET Profit']:.2f} after costs "
         f"(gross {row['Gross Profit']:.2f}, costs {row['Total Costs']:.2f})\n"
         f"ROI {row['ROI %']}% | Annualized {row['Annualized %']}% | Liquidity {row['Liquidity Score']}\n"
         f"{legs}\n"
@@ -491,7 +541,6 @@ ANGEL_MASTER_URLS = [
     "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json",
     "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
 ]
-ANGEL_BANKNIFTY_SPOT = ("NSE", "99926009")   # Nifty Bank index token
 
 
 def totp_now(secret: str, t: float | None = None, digits: int = 6, step: int = 30) -> str:
@@ -578,25 +627,33 @@ def load_angel_master() -> list[dict]:
 _OPTS_CACHE: dict = {}
 
 
-def get_angel_banknifty_options(force: bool = False) -> pd.DataFrame:
-    """BANKNIFTY option contracts, downloaded once per day. Only the small filtered table is kept in memory."""
+def get_angel_options(symbol: str = "BANKNIFTY", force: bool = False, cfg: dict | None = None) -> pd.DataFrame:
+    """Option contracts for one underlying (segment + name), downloaded once per day.
+    The big instrument file is filtered into small tables for all known underlyings in one pass."""
+    cfg = cfg or INSTRUMENTS[symbol]
+    key = (cfg["angel_seg"], cfg["angel_name"])
     today = now_ist().date()
-    if not force and _OPTS_CACHE.get("date") == today:
-        return _OPTS_CACHE["opts"]
-    master = load_angel_master()
-    opts = angel_banknifty_options(master)
-    del master
+    if force or _OPTS_CACHE.get("date") != today:
+        _OPTS_CACHE.clear()
+        _OPTS_CACHE.update(date=today, tables={})
+    tables = _OPTS_CACHE["tables"]
+    if key not in tables:
+        master = load_angel_master()
+        wanted = {(c["angel_seg"], c["angel_name"]) for c in INSTRUMENTS.values()} | {key}
+        for k in wanted:
+            tables.setdefault(k, _angel_table(master, *k))
+        del master
+    opts = tables[key]
     if opts.empty:
-        raise RuntimeError("Angel One instrument list had no BANKNIFTY option contracts.")
-    _OPTS_CACHE.update(date=today, opts=opts)
+        raise RuntimeError(f"Angel One instrument list had no option contracts for {key[1]} on {key[0]}. "
+                           "Check the Angel segment/name in Settings > Instrument settings.")
     return opts
 
 
-def angel_banknifty_options(master: list[dict]) -> pd.DataFrame:
-    """BANKNIFTY index options from the master: columns expiry, strike, type, token, symbol."""
+def _angel_table(master: list[dict], seg: str, name: str) -> pd.DataFrame:
     rows = []
     for m in master:
-        if m.get("exch_seg") != "NFO" or m.get("name") != "BANKNIFTY" or m.get("instrumenttype") != "OPTIDX":
+        if m.get("exch_seg") != seg or m.get("name") != name or m.get("instrumenttype") != "OPTIDX":
             continue
         sym = str(m.get("symbol", ""))
         typ = sym[-2:]
@@ -611,9 +668,20 @@ def angel_banknifty_options(master: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["expiry", "strike", "type", "token", "symbol"])
 
 
-def angel_monthly_expiries(opts: pd.DataFrame, n: int = 3) -> list[date]:
+def angel_instrument_options(master: list[dict], symbol: str = "BANKNIFTY") -> pd.DataFrame:
+    """Index options of one built-in underlying from the master: expiry, strike, type, token, symbol."""
+    cfg = INSTRUMENTS[symbol]
+    return _angel_table(master, cfg["angel_seg"], cfg["angel_name"])
+
+
+def angel_expiries(opts: pd.DataFrame, symbol: str = "BANKNIFTY", weekly: bool = False, n: int | None = None,
+                   cfg: dict | None = None) -> list[date]:
+    cfg = cfg or INSTRUMENTS[symbol]
+    include_weekly = weekly and cfg["has_weekly"]
+    n = n or (6 if include_weekly else 3)
     today = now_ist().date()
-    return monthly_from_list(e for e in opts["expiry"].unique() if e >= today)[:n]
+    exps = sorted(e for e in opts["expiry"].unique() if e >= today)
+    return (exps if include_weekly else monthly_from_list(exps, cfg["weekday"]))[:n]
 
 
 def _angel_quotes(conn, exchange: str, tokens: list[str]) -> dict[str, dict]:
@@ -649,21 +717,23 @@ def _best(depth: dict, side: str) -> float:
     return np.nan if (np.isnan(p) or p <= 0) else p
 
 
-def fetch_angel_chain(conn, opts: pd.DataFrame, expiry: date, band: float) -> tuple[pd.DataFrame, float]:
+def fetch_angel_chain(conn, opts: pd.DataFrame, expiry: date, band: float,
+                      symbol: str = "BANKNIFTY", cfg: dict | None = None) -> tuple[pd.DataFrame, float]:
     """Spot -> ATM -> quotes for strikes within +/- band -> our CSV schema."""
-    ex, tok = ANGEL_BANKNIFTY_SPOT
+    cfg = cfg or INSTRUMENTS[symbol]
+    ex, tok = cfg["angel_spot"]
     spot_q = _angel_quotes(conn, ex, [tok]).get(tok)
     spot = _num((spot_q or {}).get("ltp"))
     if np.isnan(spot) or spot <= 0:
-        raise RuntimeError("Could not read Bank Nifty spot from Angel One.")
+        raise RuntimeError(f"Could not read {cfg['short']} spot from Angel One.")
     e = opts[opts["expiry"] == expiry]
     strikes = np.sort(e["strike"].unique())
     if len(strikes) < 2:
-        raise RuntimeError("No Bank Nifty option contracts found for this expiry.")
+        raise RuntimeError(f"No {cfg['short']} option contracts found for this expiry.")
     interval = float(np.median(np.diff(strikes)))
     atm = round(spot / interval) * interval
     e = e[(e["strike"] >= atm - band) & (e["strike"] <= atm + band)]
-    quotes = _angel_quotes(conn, "NFO", list(e["token"]))
+    quotes = _angel_quotes(conn, cfg["angel_seg"], list(e["token"]))
     rows = {}
     for _, c in e.iterrows():
         q = quotes.get(c["token"])
