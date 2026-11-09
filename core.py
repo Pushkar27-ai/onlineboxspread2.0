@@ -104,6 +104,18 @@ def validate(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     return df.sort_values(["expiry_date", "strike"]).reset_index(drop=True), warnings
 
 
+def monthly_from_list(dates) -> list[date]:
+    """
+    Monthly expiry = the LAST expiry date of each calendar month in the list.
+    This handles holiday shifts (e.g. Tuesday holiday -> Monday expiry) that a
+    fixed 'last Tuesday' rule would miss.
+    """
+    last: dict[tuple[int, int], date] = {}
+    for d in sorted(set(dates)):
+        last[(d.year, d.month)] = d
+    return sorted(last.values())
+
+
 def is_monthly_expiry(d: date) -> bool:
     """True if d is the last Tuesday of its month (Bank Nifty monthly expiry)."""
     last_day = calendar.monthrange(d.year, d.month)[1]
@@ -370,7 +382,7 @@ def get_monthly_expiries(token: str, n: int = 3) -> list[date]:
     try:
         js = _upstox_get("/option/contract", token, {"instrument_key": BANKNIFTY_KEY})
         exps = {_to_date(c.get("expiry")) for c in js.get("data", [])}
-        exps = sorted(e for e in exps if e and e >= today and is_monthly_expiry(e))
+        exps = monthly_from_list(e for e in exps if e and e >= today)
         if exps:
             return exps[:n]
     except RuntimeError as e:
@@ -601,9 +613,7 @@ def angel_banknifty_options(master: list[dict]) -> pd.DataFrame:
 
 def angel_monthly_expiries(opts: pd.DataFrame, n: int = 3) -> list[date]:
     today = now_ist().date()
-    exps = sorted(e for e in opts["expiry"].unique() if e >= today)
-    monthly = [e for e in exps if is_monthly_expiry(e)]
-    return (monthly or exps)[:n]
+    return monthly_from_list(e for e in opts["expiry"].unique() if e >= today)[:n]
 
 
 def _angel_quotes(conn, exchange: str, tokens: list[str]) -> dict[str, dict]:

@@ -18,10 +18,10 @@ Keep `sample_option_chain.csv` in the same folder as `app.py`.
 ## CSV format
 `strike, ce_bid, ce_ask, ce_oi, ce_volume, pe_bid, pe_ask, pe_oi, pe_volume, expiry_date`
 (expiry as YYYY-MM-DD). Duplicates are removed, NaN prices are skipped, and only
-monthly expiries (last Tuesday) are offered unless you tick the testing override.
-The sample is synthetic (spot 54,600, expiry 24-Nov-2026) with one planted mispricing
+the last expiry of each month is offered as the monthly expiry (so holiday-shifted expiries work) unless you tick the testing override.
+The sample is synthetic (spot 54,600, expiry 23-Nov-2026) with one planted mispricing
 at the 54,300 call so you can see a hit. Set the valuation date to 2026-11-03 for the
-same days-to-expiry (21) used in testing.
+same days-to-expiry (20) used in testing.
 
 ## Math (short note)
 Debit box: buy CE@L, sell CE@H, buy PE@H, sell PE@L. Payoff at expiry = H - L always.
@@ -93,3 +93,6 @@ depth, plus OI and volume); the contract list comes from Angel's instrument mast
 - **Security:** PIN and TOTP secret are far more sensitive than a read-only token. Run this on your own
   laptop and use environment variables (ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PIN, ANGEL_TOTP_SECRET).
   Do not put them into a public Streamlit Cloud app.
+
+**Update (v3.1):** Angel One now uses plain REST calls, so `smartapi-python` and `pyotp` are no longer needed
+(TOTP is computed with Python's standard library). `requirements.txt` was reduced accordingly.

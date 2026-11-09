@@ -14,7 +14,7 @@ import streamlit as st
 import core
 from core import (CostConfig, FilterConfig, LOT_SIZE, REQUIRED_COLS, get_angel_banknifty_options,
                   angel_login, angel_monthly_expiries, atm_band, fetch_angel_chain, fetch_live_chain,
-                  apply_ltp_fallback, find_opportunities, format_alert, get_monthly_expiries, is_monthly_expiry,
+                  apply_ltp_fallback, find_opportunities, format_alert, get_monthly_expiries, monthly_from_list,
                   load_data, market_open_now, now_ist, select_new_alerts, send_telegram, validate)
 
 DISCLAIMER = (
@@ -251,9 +251,9 @@ def main():
             return
 
     expiries = sorted(chain["expiry_date"].unique())
-    allowed = expiries if allow_non_monthly else [e for e in expiries if is_monthly_expiry(e)]
+    allowed = expiries if allow_non_monthly else monthly_from_list(expiries)
     if not allowed:
-        st.error("No monthly expiries (last Tuesday of the month) found in the data. "
+        st.error("No monthly expiry found in the data. "
                  "Tick 'Allow non-monthly expiries' to override.")
         return
     expiry = st.selectbox("Expiry", allowed, format_func=lambda d: d.strftime("%d-%b-%Y"))
